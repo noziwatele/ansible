@@ -14,6 +14,14 @@ import tempfile
 
 from .. import types as t
 
+from ..encoding import (
+    to_bytes,
+)
+
+from ..io import (
+    read_text_file,
+)
+
 from ..util import (
     ApplicationError,
     display,
@@ -21,7 +29,6 @@ from ..util import (
     import_plugins,
     load_plugins,
     ABC,
-    to_bytes,
     ANSIBLE_TEST_CONFIG_ROOT,
 )
 
@@ -190,12 +197,7 @@ class CloudBase(ABC):
         def config_callback(files):  # type: (t.List[t.Tuple[str, str]]) -> None
             """Add the config file to the payload file list."""
             if self._get_cloud_config(self._CONFIG_PATH, ''):
-                if data_context().content.collection:
-                    working_path = data_context().content.collection.directory
-                else:
-                    working_path = ''
-
-                pair = (self.config_path, os.path.join(working_path, os.path.relpath(self.config_path, data_context().content.root)))
+                pair = (self.config_path, os.path.relpath(self.config_path, data_context().content.root))
 
                 if pair not in files:
                     display.info('Including %s config: %s -> %s' % (self.platform, pair[0], pair[1]), verbosity=3)
@@ -365,11 +367,10 @@ class CloudProvider(CloudBase):
         """
         :rtype: str
         """
-        with open(self.config_template_path, 'r') as template_fd:
-            lines = template_fd.read().splitlines()
-            lines = [l for l in lines if not l.startswith('#')]
-            config = '\n'.join(lines).strip() + '\n'
-            return config
+        lines = read_text_file(self.config_template_path).splitlines()
+        lines = [line for line in lines if not line.startswith('#')]
+        config = '\n'.join(lines).strip() + '\n'
+        return config
 
     @staticmethod
     def _populate_config_template(template, values):

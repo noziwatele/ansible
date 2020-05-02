@@ -165,14 +165,21 @@ class ActionBase(with_metaclass(ABCMeta, object)):
             # Check to determine if PowerShell modules are supported, and apply
             # some fixes (hacks) to module name + args.
             if mod_type == '.ps1':
-                # win_stat, win_file, and win_copy are not just like their
+                # FIXME: This should be temporary and moved to an exec subsystem plugin where we can define the mapping
+                # for each subsystem.
+                win_collection = 'ansible.windows'
+
+                # async_status, win_stat, win_file, win_copy, and win_ping are not just like their
                 # python counterparts but they are compatible enough for our
                 # internal usage
-                if module_name in ('stat', 'file', 'copy') and self._task.action != module_name:
-                    module_name = 'win_%s' % module_name
+                if module_name in ('stat', 'file', 'copy', 'ping') and self._task.action != module_name:
+                    module_name = '%s.win_%s' % (win_collection, module_name)
+                elif module_name in ['async_status']:
+                    module_name = '%s.%s' % (win_collection, module_name)
 
                 # Remove extra quotes surrounding path parameters before sending to module.
-                if module_name in ('win_stat', 'win_file', 'win_copy', 'slurp') and module_args and hasattr(self._connection._shell, '_unquote'):
+                if module_name.split('.')[-1] in ['win_stat', 'win_file', 'win_copy', 'slurp'] and module_args and \
+                        hasattr(self._connection._shell, '_unquote'):
                     for key in ('src', 'dest', 'path'):
                         if key in module_args:
                             module_args[key] = self._connection._shell._unquote(module_args[key])
@@ -332,18 +339,18 @@ class ActionBase(with_metaclass(ABCMeta, object)):
         Create and return a temporary path on a remote box.
         '''
 
-        become_unprivileged = self._is_become_unprivileged()
-        remote_tmp = self.get_shell_option('remote_tmp', default='~/.ansible/tmp')
-
-        # deal with tmpdir creation
-        basefile = 'ansible-tmp-%s-%s' % (time.time(), random.randint(0, 2**48))
         # Network connection plugins (network_cli, netconf, etc.) execute on the controller, rather than the remote host.
         # As such, we want to avoid using remote_user for paths  as remote_user may not line up with the local user
         # This is a hack and should be solved by more intelligent handling of remote_tmp in 2.7
         if getattr(self._connection, '_remote_is_local', False):
             tmpdir = C.DEFAULT_LOCAL_TMP
         else:
-            tmpdir = self._remote_expand_user(remote_tmp, sudoable=False)
+            # NOTE: shell plugins should populate this setting anyways, but they dont do remote expansion, which
+            # we need for 'non posix' systems like cloud-init and solaris
+            tmpdir = self._remote_expand_user(self.get_shell_option('remote_tmp', default='~/.ansible/tmp'), sudoable=False)
+
+        become_unprivileged = self._is_become_unprivileged()
+        basefile = self._connection._shell._generate_temp_dir_name()
         cmd = self._connection._shell.mkdtemp(basefile=basefile, system=become_unprivileged, tmpdir=tmpdir)
         result = self._low_level_execute_command(cmd, sudoable=False)
 
@@ -362,9 +369,9 @@ class ActionBase(with_metaclass(ABCMeta, object)):
             elif u'No space left on device' in result['stderr']:
                 output = result['stderr']
             else:
-                output = ('Authentication or permission failure. '
+                output = ('Failed to create temporary directory.'
                           'In some cases, you may have been able to authenticate and did not have permissions on the target directory. '
-                          'Consider changing the remote tmp path in ansible.cfg to a path rooted in "/tmp". '
+                          'Consider changing the remote tmp path in ansible.cfg to a path rooted in "/tmp", for more error information use -vvv. '
                           'Failed command was: %s, exited with result %d' % (cmd, result['rc']))
             if 'stdout' in result and result['stdout'] != u'':
                 output = output + u", stdout output: %s" % result['stdout']
@@ -524,7 +531,7 @@ class ActionBase(with_metaclass(ABCMeta, object)):
                         # way only if the user opted in in the config file
                         display.warning('Using world-readable permissions for temporary files Ansible needs to create when becoming an unprivileged user. '
                                         'This may be insecure. For information on securing this, see '
-                                        'https://docs.ansible.com/ansible/become.html#becoming-an-unprivileged-user')
+                                        'https://docs.ansible.com/ansible/user_guide/become.html#risks-of-becoming-an-unprivileged-user')
                         res = self._remote_chmod(remote_paths, 'a+%s' % chmod_mode)
                         if res['rc'] != 0:
                             raise AnsibleError('Failed to set file mode on remote files (rc: {0}, err: {1})'.format(res['rc'], to_native(res['stderr'])))
@@ -707,7 +714,8 @@ class ActionBase(with_metaclass(ABCMeta, object)):
             module_args['_ansible_check_mode'] = False
 
         # set no log in the module arguments, if required
-        module_args['_ansible_no_log'] = self._play_context.no_log or C.DEFAULT_NO_TARGET_SYSLOG
+        no_target_syslog = C.config.get_config_value('DEFAULT_NO_TARGET_SYSLOG', variables=task_vars)
+        module_args['_ansible_no_log'] = self._play_context.no_log or no_target_syslog
 
         # set debug in the module arguments, if required
         module_args['_ansible_debug'] = C.DEFAULT_DEBUG
@@ -1045,10 +1053,14 @@ class ActionBase(with_metaclass(ABCMeta, object)):
             display.debug("_low_level_execute_command(): changing cwd to %s for this command" % chdir)
             cmd = self._connection._shell.append_command('cd %s' % chdir, cmd)
 
+        # https://github.com/ansible/ansible/issues/68054
+        if executable:
+            self._connection._shell.executable = executable
+
         ruser = self._get_remote_user()
         buser = self.get_become_option('become_user')
         if (sudoable and self._connection.become and  # if sudoable and have become
-                self._connection.transport != 'network_cli' and  # if not using network_cli
+                self._connection.transport.split('.')[-1] != 'network_cli' and  # if not using network_cli
                 (C.BECOME_ALLOW_SAME_USER or (buser != ruser or not any((ruser, buser))))):  # if we allow same user PE or users are different and either is set
             display.debug("_low_level_execute_command(): using become for this command")
             cmd = self._connection.become.build_become_command(cmd, self._connection._shell)
@@ -1110,7 +1122,11 @@ class ActionBase(with_metaclass(ABCMeta, object)):
         display.debug("Going to peek to see if file has changed permissions")
         peek_result = self._execute_module(module_name='file', module_args=dict(path=destination, _diff_peek=True), task_vars=task_vars, persist_files=True)
 
-        if not peek_result.get('failed', False) or peek_result.get('rc', 0) == 0:
+        if peek_result.get('failed', False):
+            display.warning(u"Failed to get diff between '%s' and '%s': %s" % (os.path.basename(source), destination, to_text(peek_result.get(u'msg', u''))))
+            return diff
+
+        if peek_result.get('rc', 0) == 0:
 
             if peek_result.get('state') in (None, 'absent'):
                 diff['before'] = u''

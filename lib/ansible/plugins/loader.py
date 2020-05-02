@@ -18,6 +18,7 @@ from collections import defaultdict
 from ansible import constants as C
 from ansible.errors import AnsibleError
 from ansible.module_utils._text import to_bytes, to_text, to_native
+from ansible.module_utils.compat.importlib import import_module
 from ansible.module_utils.six import string_types
 from ansible.parsing.utils.yaml import from_yaml
 from ansible.parsing.yaml.loader import AnsibleLoader
@@ -31,12 +32,6 @@ try:
     imp = None
 except ImportError:
     import imp
-
-# HACK: keep Python 2.6 controller tests happy in CI until they're properly split
-try:
-    from importlib import import_module
-except ImportError:
-    import_module = __import__
 
 display = Display()
 
@@ -352,8 +347,9 @@ class PluginLoader:
             return full_name, to_text(n_resource_path)
 
         # look for any matching extension in the package location (sans filter)
-        ext_blacklist = ['.pyc', '.pyo']
-        found_files = [f for f in glob.iglob(os.path.join(pkg_path, n_resource) + '.*') if os.path.isfile(f) and os.path.splitext(f)[1] not in ext_blacklist]
+        found_files = [f
+                       for f in glob.iglob(os.path.join(pkg_path, n_resource) + '.*')
+                       if os.path.isfile(f) and not f.endswith(C.MODULE_IGNORE_EXTS)]
 
         if not found_files:
             return None, None
@@ -438,9 +434,8 @@ class PluginLoader:
         # TODO: Instead of using the self._paths cache (PATH_CACHE) and
         #       self._searched_paths we could use an iterator.  Before enabling that
         #       we need to make sure we don't want to add additional directories
-        #       (add_directory()) once we start using the iterator.  Currently, it
-        #       looks like _get_paths() never forces a cache refresh so if we expect
-        #       additional directories to be added later, it is buggy.
+        #       (add_directory()) once we start using the iterator.
+        #       We can use _get_paths() since add_directory() forces a cache refresh.
         for path in (p for p in self._get_paths() if p not in self._searched_paths and os.path.isdir(p)):
             display.debug('trying %s' % path)
             try:
@@ -454,7 +449,7 @@ class PluginLoader:
                 # HACK: We have no way of executing python byte compiled files as ansible modules so specifically exclude them
                 # FIXME: I believe this is only correct for modules and module_utils.
                 # For all other plugins we want .pyc and .pyo should be valid
-                if any(full_path.endswith(x) for x in C.BLACKLIST_EXTS):
+                if any(full_path.endswith(x) for x in C.MODULE_IGNORE_EXTS):
                     continue
 
                 splitname = os.path.splitext(full_name)
@@ -575,7 +570,12 @@ class PluginLoader:
 
         if not class_only:
             try:
-                obj = obj(*args, **kwargs)
+                # A plugin may need to use its _load_name in __init__ (for example, to set
+                # or get options from config), so update the object before using the constructor
+                instance = object.__new__(obj)
+                self._update_object(instance, name, path)
+                obj.__init__(instance, *args, **kwargs)
+                obj = instance
             except TypeError as e:
                 if "abstract" in e.args[0]:
                     # Abstract Base Class.  The found plugin file does not
